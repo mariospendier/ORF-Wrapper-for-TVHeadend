@@ -8,25 +8,40 @@ Save files in supposed locations:
 - Systemd File
 
 systemctl daemon-reload
+
 systemctl enable --now orf_vlc_wrapper
+
 systemctl restart orf_vlc_wrapper
+
 
 The result is a wrapper server which gives you an easy and flat stream. I do not recode, so your CPU should be ok. Take your servername or IP:
 
 http://tvheadend.lan:8800/orf2b.ts
+
 http://tvheadend.lan:8800/orf2w.ts
+
 http://tvheadend.lan:8800/orf2o.ts
+
 http://tvheadend.lan:8800/orf2k.ts
+
 http://tvheadend.lan:8800/orf2n.ts
+
 http://tvheadend.lan:8800/orf2st.ts
+
 http://tvheadend.lan:8800/orf2s.ts
+
 http://tvheadend.lan:8800/orf2t.ts
+
 http://tvheadend.lan:8800/orf2v.ts
+
 
 Use theses URLs to add 9 IPTV Muxes in TVH. After a scan you should have one stream within every MUX.
 
 
-Rename the Astra channels so that you can make new Channels, with the original names. Add the new loopback services as service. Mind the EPG - just use the Astra EPG, works! Add Logo.
+Rename the Astra channels so that you can make new Channels, with the original names. 
+Add the new loopback services as service. 
+Mind the EPG - just use the Astra EPG, works! 
+Add Logo.
 
 
 Drink beer now!
