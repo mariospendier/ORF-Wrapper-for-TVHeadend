@@ -1,0 +1,53 @@
+# /etc/systemd/system/orf_vlc_wrapper.service
+
+[Unit]
+Description=ORF2 VLC wrapper (on-demand HTTP TS proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orfwrap
+Group=orfwrap
+
+ExecStart=/usr/bin/python3 /usr/local/bin/orf_vlc_wrapper.py
+
+# Robust restart behaviour
+Restart=always
+RestartSec=2
+
+# Ensure VLC has writable “home/config/cache” (fixes: Home directory not accessible)
+StateDirectory=orfwrap
+Environment=HOME=/var/lib/orfwrap
+Environment=XDG_CONFIG_HOME=/var/lib/orfwrap/config
+Environment=XDG_CACHE_HOME=/var/lib/orfwrap/cache
+
+# Allow writing the log file
+ReadWritePaths=/var/log/orf_vlc_wrapper.log
+
+# Make stop/restart deterministic even if something blocks
+TimeoutStopSec=10
+KillMode=control-group
+SendSIGKILL=yes
+
+# Hardening (safe for this workload)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+
+# Minimal capabilities / syscalls
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
