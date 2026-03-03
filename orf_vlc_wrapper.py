@@ -1,419 +1,243 @@
 #!/usr/bin/env python3
-# save this file to /usr/local/bin/orf_vlc_wrapper.py
 import os
-import sys
 import time
 import signal
-import socket
 import logging
 import threading
 import subprocess
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from typing import Dict, Optional, Set, Tuple
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, Optional, List
 
-# -------------------------
-# Config
-# -------------------------
-
-BIND_HOST = "0.0.0.0"
-BIND_PORT = 8800
-
-LOG_FILE = "/var/log/orf_vlc_wrapper.log"
-
-# If False: log lines will be "YYYY-mm-dd HH:MM:SS,ms <message>" (no INFO/ERROR)
-# If True:  log lines will include level "INFO/ERROR"
-LOG_INCLUDE_LEVEL = False
-
-# Keep Python internal logging level at INFO; errors still appear as ERROR.
-LOG_LEVEL = logging.INFO
-
-# TVHeadend base stream (pass profile)
 TVH_BASE = "http://127.0.0.1:9981/stream/service"
-TVH_PROFILE = "pass"
+PROFILE = "pass"
 
-# VLC
-VLC_BIN = "/usr/bin/cvlc"
-VLC_PLUGIN_PATH = "/usr/lib/x86_64-linux-gnu/vlc/plugins"
+LOG_PATH = "/var/log/orf_wrapper.log"
+BIND_ADDR = os.environ.get("ORF2_BIND", "0.0.0.0")
+BIND_PORT = int(os.environ.get("ORF2_PORT", "8800"))
 
-# Stop VLC after this many seconds without any client connected to that endpoint.
-IDLE_STOP_SECONDS = 20
+RESTART_BACKOFF_SEC = 1.0
+STALL_TIMEOUT_SEC = 6.0
+CHUNK_SIZE = 188 * 50
 
-# If we don't get bytes from VLC for this long while clients exist, restart VLC.
-STALL_SECONDS = 15
-
-# Socket read chunk size from VLC stdout
-READ_CHUNK = 188 * 50  # ~ 9.4KB
-
-# ORF2 service UUIDs
-SERVICES = {
-    "/orf2k.ts": ("ORF2K HD", "62b2d62afef48b374003b91d03341959"),
-    "/orf2st.ts": ("ORF2St HD", "1c991f2fcf9ec1e6f25de43ec84c91bc"),
-    "/orf2b.ts": ("ORF2B HD", "0e86eecf524585e6fe8bb27d9bbe05ec"),
-    "/orf2o.ts": ("ORF2O HD", "a02a4f4168239be22b4e2070c4027cc3"),
-    "/orf2s.ts": ("ORF2S HD", "c8187e84cfc1af8bcd94a2f5913d61b7"),
-    "/orf2t.ts": ("ORF2T HD", "be6e1693dc15631ed4194a3ff76e4e3f"),
-    "/orf2v.ts": ("ORF2V HD", "e1d798361dee619fc2a7a28d0946a8cb"),
-    "/orf2n.ts": ("ORF2N HD", "920b04e52ac34b3b0d99775420d9446e"),
-    "/orf2w.ts": ("ORF2W HD", "10ef17c5bcc0c9e44a22cd673d1facd4"),
+SERVICE_MAP: Dict[str, str] = {
+    "/orf2k.ts":  "62b2d62afef48b374003b91d03341959",
+    "/orf2st.ts": "1c991f2fcf9ec1e6f25de43ec84c91bc",
+    "/orf2b.ts":  "0e86eecf524585e6fe8bb27d9bbe05ec",
+    "/orf2o.ts":  "a02a4f4168239be22b4e2070c4027cc3",
+    "/orf2s.ts":  "c8187e84cfc1af8bcd94a2f5913d61b7",
+    "/orf2t.ts":  "be6e1693dc15631ed4194a3ff76e4e3f",
+    "/orf2v.ts":  "e1d798361dee619fc2a7a28d0946a8cb",
+    "/orf2n.ts":  "920b04e52ac34b3b0d99775420d9446e",
+    "/orf2w.ts":  "10ef17c5bcc0c9e44a22cd673d1facd4",
 }
 
-# -------------------------
-# Globals
-# -------------------------
+def setup_logging() -> logging.Logger:
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    logger = logging.getLogger("orf_wrapper")
+    logger.setLevel(logging.ERROR)
+    if not logger.handlers:
+        fh = logging.FileHandler(LOG_PATH)
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
 
-SHUTDOWN_EVENT = threading.Event()
+LOGGER = setup_logging()
 
-# -------------------------
-# Logging
-# -------------------------
+def build_ffmpeg_cmd(service_uuid: str) -> List[str]:
+    input_url = f"{TVH_BASE}/{service_uuid}?profile={PROFILE}"
 
-logger = logging.getLogger("orf_vlc_wrapper")
-logger.setLevel(LOG_LEVEL)
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-fflags", "+genpts+igndts+discardcorrupt",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-probesize", "2M",
+        "-analyzeduration", "2000000",
+        "-i", input_url,
 
-if LOG_INCLUDE_LEVEL:
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-else:
-    fmt = logging.Formatter("%(asctime)s %(message)s")
+        # Dynamisches Mapping – robust gegen ORF-PMT/PID Änderungen
+        "-map", "0:v?",
+        "-map", "0:a?",
 
-fh = logging.FileHandler(LOG_FILE)
-fh.setFormatter(fmt)
-logger.addHandler(fh)
+        "-sn", "-dn",
+        "-c", "copy",
+        "-mpegts_flags", "+resend_headers",
+        "-pat_period", "0.2",
+        "-f", "mpegts",
+        "pipe:1",
+    ]
 
-# keep console output minimal; can be removed if you want file only
-sh = logging.StreamHandler(sys.stdout)
-sh.setFormatter(fmt)
-logger.addHandler(sh)
+    return cmd
 
-
-# -------------------------
-# HTTP server class
-# -------------------------
-
-class DaemonThreadingHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-# -------------------------
-# VLC Stream Worker
-# -------------------------
-
-class VLCStream:
-    """
-    One on-demand VLC pipeline per endpoint.
-    Multiple HTTP clients can subscribe; VLC starts when first client arrives.
-    VLC stops after idle timeout.
-    """
-
-    def __init__(self, path: str, service_name: str, service_uuid: str):
+class EndpointStreamer:
+    def __init__(self, path: str, service_uuid: str):
         self.path = path
-        self.service_name = service_name
         self.service_uuid = service_uuid
-
         self._lock = threading.Lock()
-        self._clients: Set[socket.socket] = set()
+        self._clients: Dict[int, "ClientSink"] = {}
+        self._next_client_id = 1
+        self._worker_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
-        self._proc: Optional[subprocess.Popen] = None
-        self._reader_thread: Optional[threading.Thread] = None
-
-        self._last_client_left_ts = 0.0
-        self._last_bytes_ts = 0.0
-
-    def tvh_url(self) -> str:
-        return f"{TVH_BASE}/{self.service_uuid}?profile={TVH_PROFILE}"
-
-    def _build_vlc_cmd(self) -> Tuple[Dict[str, str], list]:
-        env = os.environ.copy()
-        env["VLC_PLUGIN_PATH"] = VLC_PLUGIN_PATH
-
-        # VLC: input TS -> remux TS to stdout (dst=-)
-        cmd = [
-            VLC_BIN,
-            "-I", "dummy",
-            "--demux", "ts",
-            "--no-video-title-show",
-            "--quiet",
-            "--network-caching=150",
-            self.tvh_url(),
-            "--sout", "#standard{access=file,mux=ts,dst=-}",
-            "--sout-keep",
-        ]
-        return env, cmd
-
-    def _start_vlc_locked(self) -> None:
-        if SHUTDOWN_EVENT.is_set():
-            return
-        if self._proc and self._proc.poll() is None:
-            return
-
-        env, cmd = self._build_vlc_cmd()
-        try:
-            # start_new_session=True -> own process group, so we can kill the whole group
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                bufsize=0,
-                start_new_session=True,
-            )
-            self._last_bytes_ts = time.time()
-            logger.info("%s starting VLC for %s (%s)", self.path, self.service_name, self.service_uuid)
-
-            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-            self._reader_thread.start()
-
-            threading.Thread(target=self._stderr_drain, daemon=True).start()
-
-        except Exception as e:
-            logger.error("%s failed to start VLC: %s", self.path, e)
-            self._proc = None
-
-    def _stop_vlc_locked(self) -> None:
-        proc = self._proc
-        if not proc:
-            return
-        if proc.poll() is not None:
-            self._proc = None
-            return
-
-        logger.info("%s stopping VLC (idle or shutdown)", self.path)
-
-        try:
-            # kill whole process group
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                proc.terminate()
-
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    proc.kill()
-        except Exception as e:
-            logger.error("%s error stopping VLC: %s", self.path, e)
-        finally:
-            self._proc = None
-
-    def close_all_clients(self) -> None:
+    def add_client(self, sink: "ClientSink") -> int:
         with self._lock:
-            clients = list(self._clients)
-            self._clients.clear()
+            cid = self._next_client_id
+            self._next_client_id += 1
+            self._clients[cid] = sink
 
-        for c in clients:
-            try:
-                c.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                c.close()
-            except Exception:
-                pass
+            if self._worker_thread is None or not self._worker_thread.is_alive():
+                self._stop_event.clear()
+                self._worker_thread = threading.Thread(target=self._run, daemon=True)
+                self._worker_thread.start()
 
-    def add_client(self, sock: socket.socket) -> None:
+            return cid
+
+    def remove_client(self, client_id: int) -> None:
         with self._lock:
-            self._clients.add(sock)
-            self._last_client_left_ts = 0.0
-            self._start_vlc_locked()
-
-    def remove_client(self, sock: socket.socket) -> None:
-        with self._lock:
-            if sock in self._clients:
-                self._clients.remove(sock)
+            self._clients.pop(client_id, None)
             if not self._clients:
-                self._last_client_left_ts = time.time()
+                self._stop_event.set()
 
     def _broadcast(self, data: bytes) -> None:
         dead = []
         with self._lock:
-            for c in list(self._clients):
-                try:
-                    c.sendall(data)
-                except Exception:
-                    dead.append(c)
+            for cid, sink in self._clients.items():
+                if not sink.write(data):
+                    dead.append(cid)
+        for cid in dead:
+            self.remove_client(cid)
 
-            for c in dead:
-                try:
-                    self._clients.remove(c)
-                except KeyError:
-                    pass
-                try:
-                    c.close()
-                except Exception:
-                    pass
+    def _run(self):
+        last_bytes_time = time.time()
 
-            if not self._clients and self._last_client_left_ts == 0.0:
-                self._last_client_left_ts = time.time()
+        while not self._stop_event.is_set():
+            cmd = build_ffmpeg_cmd(self.service_uuid)
 
-    def _reader_loop(self) -> None:
-        while not SHUTDOWN_EVENT.is_set():
-            with self._lock:
-                proc = self._proc
-                clients = len(self._clients)
-                last_left = self._last_client_left_ts
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                text=False,
+            )
 
-            if not proc:
-                return
-
-            # idle stop
-            if clients == 0 and last_left and (time.time() - last_left) >= IDLE_STOP_SECONDS:
-                with self._lock:
-                    self._stop_vlc_locked()
-                return
-
-            if clients == 0:
-                time.sleep(0.2)
-                continue
+            stop_stderr = threading.Event()
+            t = threading.Thread(target=self._stderr_to_log, args=(proc, stop_stderr), daemon=True)
+            t.start()
 
             try:
-                chunk = proc.stdout.read(READ_CHUNK) if proc.stdout else b""
-            except Exception:
-                chunk = b""
+                while not self._stop_event.is_set():
+                    chunk = proc.stdout.read(CHUNK_SIZE)
+                    if chunk:
+                        last_bytes_time = time.time()
+                        self._broadcast(chunk)
+                    else:
+                        if proc.poll() is not None:
+                            break
+                        if time.time() - last_bytes_time > STALL_TIMEOUT_SEC:
+                            LOGGER.error(f"{self.path}: ffmpeg stalled, restarting")
+                            break
+                        time.sleep(0.05)
+            finally:
+                try: proc.send_signal(signal.SIGTERM)
+                except: pass
+                try: proc.wait(timeout=2)
+                except:
+                    try: proc.kill()
+                    except: pass
+                stop_stderr.set()
 
-            if chunk:
-                self._last_bytes_ts = time.time()
-                self._broadcast(chunk)
-                continue
-
-            # no bytes
-            if proc.poll() is not None:
-                rc = proc.returncode
-                # rc=0 can be normal (stop path), so keep it INFO
-                if rc == 0:
-                    logger.info("%s VLC exited rc=0", self.path)
-                else:
-                    logger.error("%s VLC exited rc=%s", self.path, rc)
-                with self._lock:
-                    self._proc = None
-                return
-
-            # stall -> restart
-            if (time.time() - self._last_bytes_ts) > STALL_SECONDS:
-                logger.error("%s VLC stalled, restarting", self.path)
-                with self._lock:
-                    self._stop_vlc_locked()
-                    if self._clients and not SHUTDOWN_EVENT.is_set():
-                        self._start_vlc_locked()
-                time.sleep(0.2)
-            else:
-                time.sleep(0.05)
-
-    def _stderr_drain(self) -> None:
-        with self._lock:
-            proc = self._proc
-        if not proc or not proc.stderr:
-            return
-        try:
-            for line in iter(proc.stderr.readline, b""):
-                if SHUTDOWN_EVENT.is_set():
+            with self._lock:
+                if not self._clients:
                     break
+
+            time.sleep(RESTART_BACKOFF_SEC)
+
+        with self._lock:
+            self._worker_thread = None
+
+    def _stderr_to_log(self, proc, stop_event):
+        try:
+            while not stop_event.is_set():
+                line = proc.stderr.readline()
                 if not line:
                     break
-                msg = line.decode("utf-8", errors="replace").rstrip()
-                if msg:
-                    # Treat VLC stderr as ERROR because you asked for error-level only
-                    logger.error("%s vlc[%s] %s", self.path, proc.pid, msg)
-                with self._lock:
-                    if self._proc != proc:
-                        break
-        except Exception:
-            return
+                s = line.decode("utf-8", errors="replace").rstrip()
+                if s:
+                    LOGGER.error(f"{self.path} ffmpeg[{proc.pid}] {s}")
+        except Exception as e:
+            LOGGER.error(f"{self.path}: stderr logger exception: {e}")
 
+class ClientSink:
+    def __init__(self, handler: BaseHTTPRequestHandler):
+        self._handler = handler
+        self._dead = False
+        self._lock = threading.Lock()
 
-# -------------------------
-# HTTP Handler
-# -------------------------
+    def write(self, data: bytes) -> bool:
+        if self._dead:
+            return False
+        with self._lock:
+            if self._dead:
+                return False
+            try:
+                self._handler.wfile.write(data)
+                self._handler.wfile.flush()
+                return True
+            except:
+                self._dead = True
+                return False
 
-STREAMS: Dict[str, VLCStream] = {
-    path: VLCStream(path, name, uuid)
-    for path, (name, uuid) in SERVICES.items()
-}
+STREAMERS = {path: EndpointStreamer(path, uuid) for path, uuid in SERVICE_MAP.items()}
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+class OrfHandler(BaseHTTPRequestHandler):
+    server_version = "orf-wrapper/5.0"
 
     def do_GET(self):
-        if self.path not in STREAMS:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Not Found\n")
+        if self.path == "/" or self.path == "/index.html":
+            self._handle_index()
             return
 
-        stream = STREAMS[self.path]
+        if self.path not in STREAMERS:
+            self.send_response(404)
+            self.end_headers()
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "video/MP2T")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
 
-        sock = self.connection
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(1.0)  # critical: do not block forever
+        streamer = STREAMERS[self.path]
+        sink = ClientSink(self)
+        cid = streamer.add_client(sink)
 
-        stream.add_client(sock)
         try:
-            while not SHUTDOWN_EVENT.is_set():
-                try:
-                    data = sock.recv(1)
-                    if not data:
-                        break
-                except socket.timeout:
-                    continue
-        except Exception:
-            pass
+            while not sink._dead:
+                time.sleep(0.5)
         finally:
-            stream.remove_client(sock)
-            try:
-                sock.close()
-            except Exception:
-                pass
+            streamer.remove_client(cid)
 
-    def log_message(self, format, *args):
+    def _handle_index(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        lines = ["Available endpoints:"]
+        for p in sorted(STREAMERS.keys()):
+            lines.append(f"  {p}")
+        self.wfile.write(("\n".join(lines) + "\n").encode("utf-8"))
+
+    def log_message(self, fmt, *args):
         return
 
-
-# -------------------------
-# Main
-# -------------------------
-
 def main():
-    logger.info("Starting orf_vlc_wrapper on %s:%d", BIND_HOST, BIND_PORT)
-    httpd = DaemonThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
-
-    def _shutdown(signum, frame):
-        if SHUTDOWN_EVENT.is_set():
-            return
-        SHUTDOWN_EVENT.set()
-        logger.info("Shutdown requested")
-
-        # stop accepting new connections
-        try:
-            httpd.shutdown()
-            httpd.server_close()
-        except Exception:
-            pass
-
-        # close clients + stop vlc
-        for s in STREAMS.values():
-            try:
-                s.close_all_clients()
-            except Exception:
-                pass
-            with s._lock:
-                s._stop_vlc_locked()
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
-
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        _shutdown(signal.SIGINT, None)
+    LOGGER.error(f"Starting ORF wrapper on {BIND_ADDR}:{BIND_PORT} (log: {LOG_PATH})")
+    srv = ThreadingHTTPServer((BIND_ADDR, BIND_PORT), OrfHandler)
+    srv.serve_forever()
 
 if __name__ == "__main__":
     main()
